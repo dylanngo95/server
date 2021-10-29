@@ -17458,7 +17458,7 @@ innodb_stopword_table_validate(
 	/* Validate the stopword table's (if supplied) existence and
 	of the right format */
 	int ret = stopword_table_name && !fts_valid_stopword_table(
-		stopword_table_name);
+		stopword_table_name, NULL, NULL);
 
 	row_mysql_unlock_data_dictionary(trx);
 

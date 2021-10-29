@@ -400,8 +400,10 @@ fts_read_stopword(
 	fts_string_t	str;
 	mem_heap_t*	heap;
 	ib_rbt_bound_t	parent;
+	dict_table_t*	table;
 
 	sel_node = static_cast<sel_node_t*>(row);
+	table = sel_node->table_list->table;
 	stopword_info = static_cast<fts_stopword_t*>(user_arg);
 
 	stop_words = stopword_info->cached_stopword;
@@ -416,6 +418,29 @@ fts_read_stopword(
 	str.f_n_char = 0;
 	str.f_str = static_cast<byte*>(dfield_get_data(dfield));
 	str.f_len = dfield_get_len(dfield);
+
+	if (table->versioned()) {
+		exp = que_node_get_next(exp);
+		ut_ad(exp);
+		dfield = que_node_get_val(exp);
+		dtype_t* type = dfield_get_type(dfield);
+		ut_ad(type->vers_sys_end());
+		void* data = dfield_get_data(dfield);
+		ulint len = dfield_get_len(dfield);
+		if (table->versioned_by_id()) {
+			ut_ad(len == sizeof trx_id_max_bytes);
+			if (0 != memcmp(data, trx_id_max_bytes, len)) {
+				return true;
+			}
+		} else {
+			ut_ad(len == sizeof timestamp_max_bytes);
+			if (0 != memcmp(data, timestamp_max_bytes, len)) {
+				return true;
+			}
+		}
+		ut_ad(!(exp = que_node_get_next(exp)));
+	}
+	ut_ad(!exp);
 
 	/* Only create new node if it is a value not already existed */
 	if (str.f_len != UNIV_SQL_NULL
@@ -459,8 +484,11 @@ fts_load_user_stopword(
 
 	/* Validate the user table existence in the right format */
 	bool ret= false;
-	stopword_info->charset = fts_valid_stopword_table(stopword_table_name);
+	const char* select_str;
+	pars_info_t* info = pars_info_create();
+	stopword_info->charset = fts_valid_stopword_table(stopword_table_name, &select_str, info->heap);
 	if (!stopword_info->charset) {
+		pars_info_free(info);
 cleanup:
 		if (!fts->dict_locked) {
 			mutex_exit(&dict_sys->mutex);
@@ -481,29 +509,27 @@ cleanup:
 
 	}
 
-	pars_info_t* info = pars_info_create();
-
 	pars_info_bind_id(info, "table_stopword", stopword_table_name);
 
 	pars_info_bind_function(info, "my_func", fts_read_stopword,
 				stopword_info);
 
 	que_t* graph = fts_parse_sql_no_dict_lock(
-		info,
+		info, mem_heap_printf(info->heap,
 		"DECLARE FUNCTION my_func;\n"
 		"DECLARE CURSOR c IS"
-		" SELECT value"
+		" SELECT %s"
 		" FROM $table_stopword;\n"
 		"BEGIN\n"
 		"\n"
 		"OPEN c;\n"
 		"WHILE 1 = 1 LOOP\n"
 		"  FETCH c INTO my_func();\n"
-		"  IF c % NOTFOUND THEN\n"
+		"  IF c %% NOTFOUND THEN\n"
 		"    EXIT;\n"
 		"  END IF;\n"
 		"END LOOP;\n"
-		"CLOSE c;");
+		"CLOSE c;", select_str));
 
 	for (;;) {
 		dberr_t error = fts_eval_sql(trx, graph);
@@ -6034,11 +6060,14 @@ Caller is responsible to hold dictionary locks.
 CHARSET_INFO*
 fts_valid_stopword_table(
 /*=====================*/
-	const char*	stopword_table_name)	/*!< in: Stopword table
+	const char*	stopword_table_name,	/*!< in: Stopword table
 						name */
+	const char**	select_str,
+	mem_heap_t*	heap)
 {
 	dict_table_t*	table;
 	dict_col_t*     col = NULL;
+	const char*	value = "value";
 
 	if (!stopword_table_name) {
 		return(NULL);
@@ -6056,10 +6085,10 @@ fts_valid_stopword_table(
 
 		col_name = dict_table_get_col_name(table, 0);
 
-		if (ut_strcmp(col_name, "value")) {
+		if (ut_strcmp(col_name, value)) {
 			ib::error() << "Invalid column name for stopword"
 				" table " << stopword_table_name << ". Its"
-				" first column must be named as 'value'.";
+				" first column must be named as '" << value << "'.";
 
 			return(NULL);
 		}
@@ -6074,6 +6103,12 @@ fts_valid_stopword_table(
 
 			return(NULL);
 		}
+	}
+
+	if (heap && table->versioned()) {
+		ut_ad(select_str);
+		const char* row_end = dict_table_get_col_name(table, table->vers_end);
+		*select_str = mem_heap_printf(heap, "%s, %s", value, row_end);
 	}
 
 	ut_ad(col);
